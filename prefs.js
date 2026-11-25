@@ -4,19 +4,19 @@ import Gio from 'gi://Gio';
 
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
-export default class ClaudeUsagePreferences extends ExtensionPreferences {
+export default class CopilotUsagePreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         const settings = this.getSettings();
 
         const page = new Adw.PreferencesPage({
-            title: 'Claude Usage Settings',
+            title: 'Copilot Usage Settings',
             icon_name: 'preferences-system-symbolic',
         });
         window.add(page);
 
         const generalGroup = new Adw.PreferencesGroup({
             title: 'General',
-            description: 'Configure the Claude Usage extension',
+            description: 'Configure the Copilot Usage extension',
         });
         page.add(generalGroup);
 
@@ -24,7 +24,7 @@ export default class ClaudeUsagePreferences extends ExtensionPreferences {
             title: 'Refresh Interval',
             subtitle: 'How often to refresh usage data (in seconds)',
             adjustment: new Gtk.Adjustment({
-                lower: 10,
+                lower: 60,
                 upper: 600,
                 step_increment: 10,
                 page_increment: 60,
@@ -68,29 +68,9 @@ export default class ClaudeUsagePreferences extends ExtensionPreferences {
 
         displayGroup.add(displayModeRow);
 
-        const iconStyleRow = new Adw.ComboRow({
-            title: 'Icon Style',
-            subtitle: 'Use a color or monochrome icon in the panel',
-        });
-
-        const iconStyleModel = new Gtk.StringList();
-        iconStyleModel.append('Color');
-        iconStyleModel.append('Monochrome');
-        iconStyleRow.set_model(iconStyleModel);
-
-        const currentStyle = settings.get_string('icon-style');
-        iconStyleRow.set_selected(currentStyle === 'monochrome' ? 1 : 0);
-
-        iconStyleRow.connect('notify::selected', () => {
-            const selected = iconStyleRow.get_selected();
-            settings.set_string('icon-style', selected === 1 ? 'monochrome' : 'color');
-        });
-
-        displayGroup.add(iconStyleRow);
-
         const showIconRow = new Adw.SwitchRow({
             title: 'Show Icon',
-            subtitle: 'Display the Claude icon in the top bar',
+            subtitle: 'Display the Copilot icon in the top bar',
         });
         settings.bind(
             'show-icon',

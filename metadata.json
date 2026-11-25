@@ -1,12 +1,10 @@
 {
-  "name": "Claude Code Usage",
-  "description": "Display Claude Code usage in the top panel. This extension uses anthropic.com services. This extension is not affiliated, funded, or in any way associated with Claude.",
-  "uuid": "claude-code-usage@haletran.com",
+  "name": "Copilot Usage",
+  "description": "Display GitHub Copilot usage in the top panel. This extension contacts the GitHub API of the host you are signed in to (github.com or a GitHub Enterprise Cloud host) and reads a Copilot CLI token from your system keyring. This extension is not affiliated, funded, or in any way associated with GitHub or Microsoft.",
+  "uuid": "copilot-usage@alfonder",
   "shell-version": ["46", "47", "48", "49"],
-  "url": "https://github.com/Haletran/claude-usage-extension",
-  "settings-schema": "org.gnome.shell.extensions.claude-code-usage",
-  "donations": {
-    "github": "Haletran"
-  },
-  "version": 3
+  "url": "https://github.com/alfonder/copilot-usage-extension",
+  "settings-schema": "org.gnome.shell.extensions.copilot-usage",
+  "gettext-domain": "copilot-usage",
+  "version-name": "0.1.0"
 }

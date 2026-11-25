@@ -9,39 +9,91 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
-import {Extension, gettext as _} from 'resource:///org/gnome/shell/extensions/extension.js';
+import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
-const API_URL = 'https://api.anthropic.com/api/oauth/usage';
+import {
+    parseJsonc, pickAccount, keyringUsernames, apiBaseForHost, hostname,
+    normalizeUsage, formatNumber, formatDuration,
+} from './usage.js';
 
-const ClaudeUsageIndicator = GObject.registerClass(
-class ClaudeUsageIndicator extends PanelMenu.Button {
+const KEYRING_SERVICE = 'copilot-cli';
+const USER_AGENT = 'GitHubCopilotChat/0.26.7';
+const EDITOR_VERSION = 'vscode/1.99.0';
+const DEFAULT_HOST = 'https://github.com';
+
+class UsageError extends Error {
+    constructor(short, detail) {
+        super(detail);
+        this.short = short;
+    }
+}
+
+function runCommand(argv, cancellable) {
+    return new Promise(resolve => {
+        try {
+            const proc = Gio.Subprocess.new(
+                argv,
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE
+            );
+            proc.communicate_utf8_async(null, cancellable, (p, res) => {
+                try {
+                    const [, out] = p.communicate_utf8_finish(res);
+                    resolve(p.get_successful() && out ? out.trim() : null);
+                } catch (e) {
+                    resolve(null);
+                }
+            });
+        } catch (e) {
+            resolve(null);
+        }
+    });
+}
+
+function readCopilotConfig(cancellable) {
+    const path = GLib.build_filenamev([GLib.get_home_dir(), '.copilot', 'config.json']);
+    return new Promise(resolve => {
+        Gio.File.new_for_path(path).load_contents_async(cancellable, (file, res) => {
+            try {
+                const [, contents] = file.load_contents_finish(res);
+                resolve(parseJsonc(new TextDecoder('utf-8').decode(contents)));
+            } catch (e) {
+                resolve(null);
+            }
+        });
+    });
+}
+
+const CopilotUsageIndicator = GObject.registerClass(
+class CopilotUsageIndicator extends PanelMenu.Button {
     _init(extensionPath, settings, openPreferences) {
-        super._init(0.0, 'Claude Usage Indicator');
+        super._init(0.0, 'Copilot Usage Indicator');
 
         this._extensionPath = extensionPath;
         this._settings = settings;
         this._openPreferences = openPreferences;
+        this._cancellable = new Gio.Cancellable();
         this._session = this._createSession();
+        this._lastData = null;
+        this._refreshing = false;
 
         this._box = new St.BoxLayout({
             style_class: 'panel-status-menu-box',
         });
 
-        const iconPath = GLib.build_filenamev([this._extensionPath, 'claude-icon-22.png']);
-        const gicon = Gio.icon_new_for_string(iconPath);
+        const iconPath = GLib.build_filenamev([this._extensionPath, 'copilot-symbolic.svg']);
         this._icon = new St.Icon({
-            gicon: gicon,
-            style_class: 'claude-icon',
+            gicon: Gio.icon_new_for_string(iconPath),
+            style_class: 'copilot-icon system-status-icon',
             icon_size: 16,
         });
         this._box.add_child(this._icon);
 
         this._panelProgressBg = new St.Widget({
-            style_class: 'claude-panel-progress-bg',
+            style_class: 'copilot-panel-progress-bg',
             y_align: Clutter.ActorAlign.CENTER,
         });
         this._panelProgressBar = new St.Widget({
-            style_class: 'claude-panel-progress-bar',
+            style_class: 'copilot-panel-progress-bar',
         });
         this._panelProgressBg.add_child(this._panelProgressBar);
         this._box.add_child(this._panelProgressBg);
@@ -49,7 +101,7 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         this._label = new St.Label({
             text: '...',
             y_align: Clutter.ActorAlign.CENTER,
-            style_class: 'claude-usage-label',
+            style_class: 'copilot-usage-label',
         });
         this._box.add_child(this._label);
 
@@ -59,7 +111,6 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
 
         this._updateDisplayMode();
         this._updateIconVisibility();
-        this._updateIconStyle();
 
         this._settingsChangedId = this._settings.connect('changed', (settings, key) => {
             if (key === 'refresh-interval') {
@@ -70,8 +121,6 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
                 this._updateIconVisibility();
             } else if (key === 'proxy-url') {
                 this._recreateSession();
-            } else if (key === 'icon-style') {
-                this._updateIconStyle();
             }
         });
 
@@ -97,12 +146,7 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
     }
 
     _updateIconVisibility() {
-        const showIcon = this._settings.get_boolean('show-icon');
-        if (showIcon) {
-            this._icon.show();
-        } else {
-            this._icon.hide();
-        }
+        this._icon.visible = this._settings.get_boolean('show-icon');
     }
 
     _createSession() {
@@ -118,120 +162,76 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
     }
 
     _recreateSession() {
-        if (this._session) {
+        if (this._session)
             this._session.abort();
-        }
         this._session = this._createSession();
         this._refreshUsage();
-	}
-    _updateIconStyle() {
-        const style = this._settings.get_string('icon-style');
-        const desatName = 'monochrome-desaturate';
-        const brightName = 'monochrome-brightness';
-        const hasEffect = this._icon.get_effect(desatName) !== null;
+    }
 
-        if (style === 'monochrome' && !hasEffect) {
-            this._icon.add_effect(new Clutter.DesaturateEffect({factor: 1.0, name: desatName}));
-            const brightnessEffect = new Clutter.BrightnessContrastEffect({name: brightName});
-            brightnessEffect.set_brightness_full(1, 1, 1);
-            this._icon.add_effect(brightnessEffect);
-        } else if (style !== 'monochrome' && hasEffect) {
-            this._icon.remove_effect_by_name(desatName);
-            this._icon.remove_effect_by_name(brightName);
-        }
+    _createLabelItem(styleClass) {
+        const label = new St.Label({text: '', style_class: styleClass});
+        const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+        item.add_child(label);
+        this.menu.addMenuItem(item);
+        return {item, label};
     }
 
     _createMenu() {
-        const fiveHourBox = new St.BoxLayout({
-            style_class: 'claude-usage-section',
-            vertical: true,
+        const plan = this._createLabelItem('copilot-section-title');
+        this._planItem = plan.item;
+        this._planLabel = plan.label;
+        this._planLabel.set_text('GitHub Copilot');
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+        const box = new St.BoxLayout({style_class: 'copilot-usage-section', vertical: true});
+        const header = new St.BoxLayout({vertical: false});
+        this._titleLabel = new St.Label({
+            text: 'Monthly AI credits',
+            style_class: 'copilot-section-title',
         });
-        const fiveHourHeader = new St.BoxLayout({ vertical: false });
-        const fiveHourLabel = new St.Label({
-            text: '5-Hour Usage',
-            style_class: 'claude-section-title',
-        });
-        fiveHourHeader.add_child(fiveHourLabel);
-        this._fiveHourPercent = new St.Label({
+        header.add_child(this._titleLabel);
+        this._percentLabel = new St.Label({
             text: '...',
-            style_class: 'claude-percent-label',
+            style_class: 'copilot-percent-label',
             x_expand: true,
             x_align: Clutter.ActorAlign.END,
         });
-        fiveHourHeader.add_child(this._fiveHourPercent);
-        fiveHourBox.add_child(fiveHourHeader);
+        header.add_child(this._percentLabel);
+        box.add_child(header);
 
-        const fiveHourProgressBg = new St.Widget({
-            style_class: 'claude-progress-bg',
-        });
-        this._fiveHourProgressBar = new St.Widget({
-            style_class: 'claude-progress-bar usage-low',
-        });
-        fiveHourProgressBg.add_child(this._fiveHourProgressBar);
-        fiveHourBox.add_child(fiveHourProgressBg);
+        const progressBg = new St.Widget({style_class: 'copilot-progress-bg'});
+        this._progressBar = new St.Widget({style_class: 'copilot-progress-bar usage-low'});
+        progressBg.add_child(this._progressBar);
+        box.add_child(progressBg);
 
-        this._fiveHourResetLabel = new St.Label({
-            text: 'Resets: ...',
-            style_class: 'claude-reset-label',
-        });
-        fiveHourBox.add_child(this._fiveHourResetLabel);
+        this._detailLabel = new St.Label({text: '', style_class: 'copilot-reset-label'});
+        box.add_child(this._detailLabel);
+        this._resetLabel = new St.Label({text: 'Resets: ...', style_class: 'copilot-reset-label'});
+        box.add_child(this._resetLabel);
+        this._projectionLabel = new St.Label({text: '', style_class: 'copilot-reset-label'});
+        box.add_child(this._projectionLabel);
 
-        const fiveHourItem = new PopupMenu.PopupBaseMenuItem({
-            reactive: false,
-            can_focus: false,
-        });
-        fiveHourItem.add_child(fiveHourBox);
-        this.menu.addMenuItem(fiveHourItem);
+        const usageItem = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+        usageItem.add_child(box);
+        this.menu.addMenuItem(usageItem);
 
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        const overage = this._createLabelItem('copilot-reset-label');
+        this._overageItem = overage.item;
+        this._overageLabel = overage.label;
+        this._overageItem.hide();
 
-        const sevenDayBox = new St.BoxLayout({
-            style_class: 'claude-usage-section',
-            vertical: true,
-        });
-        const sevenDayHeader = new St.BoxLayout({ vertical: false });
-        const sevenDayLabel = new St.Label({
-            text: '7-Day Usage',
-            style_class: 'claude-section-title',
-        });
-        sevenDayHeader.add_child(sevenDayLabel);
-        this._sevenDayPercent = new St.Label({
-            text: '...',
-            style_class: 'claude-percent-label',
-            x_expand: true,
-            x_align: Clutter.ActorAlign.END,
-        });
-        sevenDayHeader.add_child(this._sevenDayPercent);
-        sevenDayBox.add_child(sevenDayHeader);
-
-        const sevenDayProgressBg = new St.Widget({
-            style_class: 'claude-progress-bg',
-        });
-        this._sevenDayProgressBar = new St.Widget({
-            style_class: 'claude-progress-bar usage-low',
-        });
-        sevenDayProgressBg.add_child(this._sevenDayProgressBar);
-        sevenDayBox.add_child(sevenDayProgressBg);
-
-        this._sevenDayResetLabel = new St.Label({
-            text: 'Resets: ...',
-            style_class: 'claude-reset-label',
-        });
-        sevenDayBox.add_child(this._sevenDayResetLabel);
-
-        const sevenDayItem = new PopupMenu.PopupBaseMenuItem({
-            reactive: false,
-            can_focus: false,
-        });
-        sevenDayItem.add_child(sevenDayBox);
-        this.menu.addMenuItem(sevenDayItem);
+        this._othersSeparator = new PopupMenu.PopupSeparatorMenuItem();
+        this.menu.addMenuItem(this._othersSeparator);
+        const others = this._createLabelItem('copilot-reset-label');
+        this._othersItem = others.item;
+        this._othersLabel = others.label;
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        const updated = this._createLabelItem('copilot-last-updated-label');
+        this._updatedLabel = updated.label;
 
         const settingsItem = new PopupMenu.PopupMenuItem('Settings');
-        settingsItem.connect('activate', () => {
-            this._openPreferences();
-        });
+        settingsItem.connect('activate', () => this._openPreferences());
         this.menu.addMenuItem(settingsItem);
     }
 
@@ -259,95 +259,170 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         this._startTimer();
     }
 
-    _refreshUsage() {
-        const configDir = GLib.getenv('CLAUDE_CONFIG_DIR') ??
-            GLib.build_filenamev([GLib.get_home_dir(), '.claude']);
-        const credentialsPath = GLib.build_filenamev([
-            configDir,
-            '.credentials.json',
-        ]);
-
-        const file = Gio.File.new_for_path(credentialsPath);
-        file.load_contents_async(null, (file, result) => {
-            try {
-                const [, contents] = file.load_contents_finish(result);
-                const decoder = new TextDecoder('utf-8');
-                const json = JSON.parse(decoder.decode(contents));
-                const token = json.claudeAiOauth?.accessToken;
-
-                if (!token) {
-                    this._label.set_text('No token');
-                    this._fiveHourPercent.set_text('No credentials');
-                    this._sevenDayPercent.set_text('—');
-                    return;
-                }
-
-                this._fetchUsage(token);
-            } catch (e) {
-                console.error('Claude Usage: Failed to read credentials:', e.message);
-                this._label.set_text('No token');
-                this._fiveHourPercent.set_text('No credentials');
-                this._sevenDayPercent.set_text('—');
-            }
-        });
+    async _refreshUsage() {
+        if (this._refreshing)
+            return;
+        this._refreshing = true;
+        try {
+            const {token, host} = await this._getCredentials();
+            const raw = await this._fetchUsage(token, host);
+            const usage = normalizeUsage(raw);
+            if (!usage)
+                throw new UsageError('Unsupported', 'No premium quota in the Copilot response');
+            this._lastData = usage;
+            this._updateDisplay(usage);
+        } catch (e) {
+            if (this._cancellable.is_cancelled())
+                return;
+            const short = e instanceof UsageError ? e.short : 'Error';
+            console.error(`Copilot Usage: ${e.message}`);
+            this._showError(short, e.message);
+        } finally {
+            this._refreshing = false;
+        }
     }
 
-    _fetchUsage(token) {
-        const message = Soup.Message.new('GET', API_URL);
-        message.request_headers.append('Authorization', `Bearer ${token}`);
-        message.request_headers.append('anthropic-beta', 'oauth-2025-04-20');
+    /**
+     * Token lookup order: Copilot CLI keyring entry, COPILOT_GITHUB_TOKEN/GH_TOKEN/
+     * GITHUB_TOKEN env vars, then `gh auth token`.
+     */
+    async _getCredentials() {
+        const config = await readCopilotConfig(this._cancellable);
+        const account = pickAccount(config);
+        const host = account?.host ?? DEFAULT_HOST;
 
-        this._session.send_and_read_async(
-            message,
-            GLib.PRIORITY_DEFAULT,
-            null,
-            (session, result) => {
-                try {
-                    const bytes = session.send_and_read_finish(result);
+        let token = null;
+        if (account) {
+            for (const username of keyringUsernames(account.host, account.login)) {
+                token = await runCommand(
+                    ['secret-tool', 'lookup', 'service', KEYRING_SERVICE, 'username', username],
+                    this._cancellable
+                );
+                if (token)
+                    break;
+            }
+        }
 
-                    if (message.status_code !== 200) {
-                        this._label.set_text('Error');
-                        this._fiveHourPercent.set_text(`HTTP ${message.status_code}`);
-                        return;
+        token ??= GLib.getenv('COPILOT_GITHUB_TOKEN') ?? GLib.getenv('GH_TOKEN') ??
+            GLib.getenv('GITHUB_TOKEN');
+
+        if (!token) {
+            token = await runCommand(
+                ['gh', 'auth', 'token', '--hostname', hostname(host)],
+                this._cancellable
+            );
+        }
+
+        if (!token) {
+            throw new UsageError(
+                'No token',
+                'No Copilot token found. Sign in with the Copilot CLI and install secret-tool (libsecret-tools).'
+            );
+        }
+        return {token, host};
+    }
+
+    async _fetchUsage(token, host) {
+        const base = apiBaseForHost(host);
+        if (!base)
+            throw new UsageError('Error', `Invalid host in Copilot config: ${host}`);
+
+        const message = Soup.Message.new('GET', `${base}/copilot_internal/user`);
+        const headers = message.request_headers;
+        headers.append('Authorization', `token ${token}`);
+        headers.append('Accept', 'application/json');
+        headers.append('User-Agent', USER_AGENT);
+        headers.append('Editor-Version', EDITOR_VERSION);
+
+        const bytes = await new Promise((resolve, reject) => {
+            this._session.send_and_read_async(
+                message, GLib.PRIORITY_DEFAULT, this._cancellable,
+                (session, result) => {
+                    try {
+                        resolve(session.send_and_read_finish(result));
+                    } catch (e) {
+                        reject(e);
                     }
-
-                    const decoder = new TextDecoder('utf-8');
-                    const data = JSON.parse(decoder.decode(bytes.get_data()));
-
-                    this._updateDisplay(data);
-                } catch (e) {
-                    console.error('Claude Usage: Failed to fetch usage:', e.message);
-                    this._label.set_text('Error');
                 }
-            }
-        );
+            );
+        });
+
+        const status = message.status_code;
+        if (status === 401)
+            throw new UsageError('Sign in', 'Copilot token rejected (401). Sign in again with the Copilot CLI.');
+        if (status === 403 || status === 429)
+            throw new UsageError('Rate limit', `Access denied or rate limited (HTTP ${status}).`);
+        if (status === 404)
+            throw new UsageError('No Copilot', 'No Copilot access found for this account (HTTP 404).');
+        if (status !== 200)
+            throw new UsageError('Error', `Unexpected response (HTTP ${status}).`);
+
+        return JSON.parse(new TextDecoder('utf-8').decode(bytes.get_data()));
     }
 
-    _updateDisplay(data) {
-        const fiveHour = data.five_hour?.utilization ?? 0;
-        const sevenDay = data.seven_day?.utilization ?? 0;
+    _showError(short, detail) {
+        if (this._lastData) {
+            this._updatedLabel.set_text(`Update failed: ${short}. Showing last data.`);
+            return;
+        }
+        this._label.set_text(short);
+        this._percentLabel.set_text('—');
+        this._detailLabel.set_text(detail);
+        this._resetLabel.set_text('');
+        this._projectionLabel.set_text('');
+        this._updatePanelProgressBar(0);
+        this._updateProgressBar(this._progressBar, 0);
+    }
 
-        this._label.set_text(`${Math.round(fiveHour)}%`);
+    _updateDisplay(u) {
+        const unit = u.unit === 'credits' ? 'credits' : 'requests';
+        this._planLabel.set_text(u.plan ? `GitHub Copilot ${this._capitalize(u.plan)}` : 'GitHub Copilot');
+        this._titleLabel.set_text(u.unit === 'credits' ? 'Monthly AI credits' : 'Premium requests');
 
-        this._updatePanelProgressBar(fiveHour);
-
-        this._fiveHourPercent.set_text(`${fiveHour.toFixed(1)}%`);
-        this._updateProgressBar(this._fiveHourProgressBar, fiveHour);
-
-        this._sevenDayPercent.set_text(`${sevenDay.toFixed(1)}%`);
-        this._updateProgressBar(this._sevenDayProgressBar, sevenDay);
-
-        if (data.five_hour?.resets_at) {
-            this._fiveHourResetLabel.set_text(
-                `Resets in ${this._formatResetTime(data.five_hour.resets_at)}`
+        if (u.unlimited) {
+            this._label.set_text('∞');
+            this._percentLabel.set_text('Unlimited');
+            this._detailLabel.set_text(`${formatNumber(u.used)} ${unit} used`);
+            this._projectionLabel.set_text('');
+            this._updatePanelProgressBar(0);
+            this._updateProgressBar(this._progressBar, 0, true);
+        } else {
+            this._label.set_text(`${Math.round(u.percent)}%`);
+            this._percentLabel.set_text(`${u.percent.toFixed(1)}%`);
+            this._detailLabel.set_text(
+                `${formatNumber(u.used)} / ${formatNumber(u.total)} ${unit} used · ${formatNumber(u.remaining)} left`
             );
+            this._projectionLabel.set_text(
+                u.projected !== null
+                    ? `Projected: ~${formatNumber(u.projected)} by month end (${Math.round(u.projectedPercent)}%)`
+                    : ''
+            );
+            this._updatePanelProgressBar(u.percent);
+            this._updateProgressBar(this._progressBar, u.percent);
         }
 
-        if (data.seven_day?.resets_at) {
-            this._sevenDayResetLabel.set_text(
-                `Resets in ${this._formatResetTime(data.seven_day.resets_at)}`
-            );
+        const resetIn = formatDuration(u.resetAt.getTime() - Date.now());
+        this._resetLabel.set_text(`Resets in ${resetIn} (${u.resetAt.toISOString().slice(0, 10)} 00:00 UTC)`);
+
+        if (u.overage > 0) {
+            this._overageLabel.set_text(`Overage: ${formatNumber(u.overage)} ${unit}`);
+            this._overageItem.show();
+        } else {
+            this._overageItem.hide();
         }
+
+        const others = u.others.map(o => o.unlimited
+            ? `${o.label}: Unlimited`
+            : `${o.label}: ${formatNumber(o.used)} / ${formatNumber(o.total)}`);
+        this._othersLabel.set_text(others.join('\n'));
+        this._othersItem.visible = others.length > 0;
+        this._othersSeparator.visible = others.length > 0;
+
+        this._updatedLabel.set_text(`Updated ${GLib.DateTime.new_now_local().format('%H:%M')}`);
+    }
+
+    _capitalize(s) {
+        return s.charAt(0).toUpperCase() + s.slice(1);
     }
 
     _updatePanelProgressBar(usage) {
@@ -356,55 +431,29 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         this._panelProgressBar.set_width(width);
     }
 
-    _updateProgressBar(progressBar, usage) {
+    _updateProgressBar(progressBar, usage, unlimited = false) {
         const maxWidth = 200;
         const width = Math.round((Math.min(100, Math.max(0, usage)) / 100) * maxWidth);
         progressBar.set_width(width);
 
-        progressBar.remove_style_class_name('usage-low');
-        progressBar.remove_style_class_name('usage-medium');
-        progressBar.remove_style_class_name('usage-high');
-        progressBar.remove_style_class_name('usage-critical');
+        for (const cls of ['usage-low', 'usage-medium', 'usage-high', 'usage-critical', 'usage-unlimited'])
+            progressBar.remove_style_class_name(cls);
 
-        if (usage >= 90) {
+        if (unlimited)
+            progressBar.add_style_class_name('usage-unlimited');
+        else if (usage >= 90)
             progressBar.add_style_class_name('usage-critical');
-        } else if (usage >= 70) {
+        else if (usage >= 70)
             progressBar.add_style_class_name('usage-high');
-        } else if (usage >= 40) {
+        else if (usage >= 40)
             progressBar.add_style_class_name('usage-medium');
-        } else {
+        else
             progressBar.add_style_class_name('usage-low');
-        }
-    }
-
-    _formatResetTime(isoString) {
-        try {
-            const resetDate = new Date(isoString);
-            const now = new Date();
-            const diffMs = resetDate - now;
-
-            if (diffMs < 0) {
-                return 'now';
-            }
-
-            const diffMins = Math.floor(diffMs / 60000);
-            const diffHours = Math.floor(diffMins / 60);
-            const diffDays = Math.floor(diffHours / 24);
-
-            if (diffDays > 0) {
-                return `${diffDays}d ${diffHours % 24}h`;
-            } else if (diffHours > 0) {
-                return `${diffHours}h ${diffMins % 60}m`;
-            } else {
-                return `${diffMins}m`;
-            }
-        } catch (e) {
-            return '—';
-        }
     }
 
     destroy() {
         this._stopTimer();
+        this._cancellable?.cancel();
         if (this._session) {
             this._session.abort();
             this._session = null;
@@ -417,10 +466,10 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
     }
 });
 
-export default class ClaudeUsageExtension extends Extension {
+export default class CopilotUsageExtension extends Extension {
     enable() {
         this._settings = this.getSettings();
-        this._indicator = new ClaudeUsageIndicator(
+        this._indicator = new CopilotUsageIndicator(
             this.path,
             this._settings,
             () => this.openPreferences()

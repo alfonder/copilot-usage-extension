@@ -1,15 +1,15 @@
 /* Panel button styles */
-.claude-icon {
+.copilot-icon {
     margin-right: 6px;
 }
 
-.claude-usage-label {
+.copilot-usage-label {
     font-size: 12px;
     font-weight: bold;
 }
 
 /* Panel progress bar */
-.claude-panel-progress-bg {
+.copilot-panel-progress-bg {
     background-color: rgba(255, 255, 255, 0.2);
     border-radius: 3px;
     height: 10px;
@@ -17,7 +17,7 @@
     margin-left: 4px;
 }
 
-.claude-panel-progress-bar {
+.copilot-panel-progress-bar {
     height: 10px;
     border-radius: 3px;
     transition: width 300ms ease-out;
@@ -25,85 +25,66 @@
 }
 
 /* Usage section styles */
-.claude-usage-section {
+.copilot-usage-section {
     padding: 4px 0;
     spacing: 6px;
     min-width: 220px;
 }
 
-.claude-section-title {
+.copilot-section-title {
     font-size: 13px;
     font-weight: 600;
-    color: #e0e0e0;
 }
 
-.claude-percent-label {
+.copilot-percent-label {
     font-size: 13px;
     font-weight: bold;
-    color: #ffffff;
 }
 
 /* Progress bar styles */
-.claude-progress-bg {
-    background-color: rgba(255, 255, 255, 0.1);
+.copilot-progress-bg {
+    background-color: rgba(128, 128, 128, 0.3);
     border-radius: 4px;
     height: 8px;
     width: 200px;
     margin: 4px 0;
 }
 
-.claude-progress-bar {
+.copilot-progress-bar {
     height: 8px;
     border-radius: 4px;
     transition: width 300ms ease-out;
 }
 
-.claude-progress-bar.usage-low {
+.copilot-progress-bar.usage-low {
     background-color: #22c55e;
 }
 
-.claude-progress-bar.usage-medium {
+.copilot-progress-bar.usage-medium {
     background-color: #eab308;
 }
 
-.claude-progress-bar.usage-high {
+.copilot-progress-bar.usage-high {
     background-color: #f97316;
 }
 
-.claude-progress-bar.usage-critical {
+.copilot-progress-bar.usage-critical {
     background-color: #ef4444;
 }
 
 /* Reset label styles */
-.claude-reset-label {
+.copilot-reset-label {
     font-size: 11px;
-    color: #a0a0a0;
+    color: #8a8a8a;
 }
 
-/* Footer styles */
-.claude-footer-box {
-    padding: 6px 0;
-    spacing: 12px;
-}
-
-.claude-refresh-button {
-    padding: 4px 12px;
-    border-radius: 4px;
-    background-color: rgba(255, 255, 255, 0.1);
-    color: #ffffff;
-    font-size: 12px;
-}
-
-.claude-refresh-button:hover {
-    background-color: rgba(255, 255, 255, 0.2);
-}
-
-.claude-refresh-button:active {
-    background-color: rgba(255, 255, 255, 0.15);
-}
-
-.claude-last-updated-label {
+.copilot-last-updated-label {
     font-size: 10px;
     font-style: italic;
     color: #808080;
+}
+
+.copilot-progress-bar.usage-unlimited {
+    background-color: rgba(128, 128, 128, 0.55);
+    width: 200px;
 }

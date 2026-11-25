@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
+# Install the working copy into the local GNOME Shell extensions directory.
+# Usage: ./update [--logout]
+set -euo pipefail
 
-cd ..
+src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+uuid="$(sed -n 's/.*"uuid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$src/metadata.json")"
+[ -n "$uuid" ] || { echo "Could not read uuid from metadata.json" >&2; exit 1; }
+dest="$HOME/.local/share/gnome-shell/extensions/$uuid"
 
-if [ -d claude-usage-extension ]; then
-	rm -rf ~/.local/share/gnome-shell/extensions/claude-code-usage@haletran.com
-	cp -r claude-usage-extension ~/.local/share/gnome-shell/extensions/claude-code-usage@haletran.com 
-	cd ~/.local/share/gnome-shell/extensions/claude-code-usage@haletran.com/schemas
-	glib-compile-schemas .
-	gnome-session-quit --no-prompt
+mkdir -p "$dest"
+rsync -a --delete --exclude '.git' --exclude '*.zip' --exclude 'update' "$src/" "$dest/"
+glib-compile-schemas "$dest/schemas"
+echo "Installed $uuid to $dest"
+
+if [ "${1:-}" = "--logout" ]; then
+    gnome-session-quit --no-prompt
 else
-	echo "Extension folder not found"
+    echo "Log out and back in (Wayland) or press Alt+F2, r (X11) to reload, then enable the extension."
 fi
