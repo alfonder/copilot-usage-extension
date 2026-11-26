@@ -97,8 +97,11 @@ export default class CopilotUsagePreferences extends ExtensionPreferences {
         networkGroup.add(proxyRow);
 
         const proxyHint = new Gtk.Label({
-            label: 'Example: http://localhost:11809 (leave empty for no proxy)',
+            label: 'Example: http://localhost:11809. Leave empty to use the system proxy settings, or enter direct:// to connect without any proxy.',
             xalign: 0,
+            wrap: true,
+            max_width_chars: 1,
+            hexpand: true,
             css_classes: ['dim-label', 'caption'],
             margin_start: 12,
             margin_top: 4,

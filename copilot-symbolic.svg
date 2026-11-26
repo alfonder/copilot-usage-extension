@@ -1,5 +1,4 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <!-- Flat monochrome goggles-style mark. Symbolic: recoloured by the shell theme. -->
-  <path fill="#bebebe" fill-rule="evenodd" d="M8 1.5c-2.2 0-3.6.8-4.4 2.2C2.4 3.9 1.5 5 1 6.6.6 7.7.5 8.9.5 10c0 2 2.6 4.5 7.5 4.5s7.5-2.5 7.5-4.5c0-1.100-.1-2.300-.5-3.400-.5-1.600-1.400-2.700-2.600-2.900C11.600 2.300 10.200 1.500 8 1.500zM5 7.500c.8 0 1.300.7 1.300 1.700S5.800 10.900 5 10.900s-1.300-.7-1.300-1.700.5-1.700 1.300-1.700zm6 0c.8 0 1.300.7 1.300 1.700s-.5 1.700-1.300 1.700-1.300-.7-1.300-1.700.5-1.700 1.300-1.700z"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Unofficial coding copilot symbol">
+<path fill="#111111" fill-rule="evenodd" d="M32 5 Q45 5 53 15 L57 27 L62 33 V45 L55 49 Q46 58 32 59 Q18 58 9 49 L2 45 V33 L7 27 L11 15 Q19 5 32 5 Z M14 20 Q14 14 21 14 H25 Q29 14 29 20 V27 Q29 33 23 33 H20 Q14 33 14 27 Z M35 20 Q35 14 39 14 H43 Q50 14 50 20 V27 Q50 33 44 33 H41 Q35 33 35 27 Z M12 38 Q32 45 52 38 V46 Q43 53 32 53 Q21 53 12 46 Z"/>
+<path fill="#111111" d="M23 42 H27 V49 H23 Z M37 42 H41 V49 H37 Z"/>
 </svg>

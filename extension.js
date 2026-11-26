@@ -21,10 +21,43 @@ const USER_AGENT = 'GitHubCopilotChat/0.26.7';
 const EDITOR_VERSION = 'vscode/1.99.0';
 const DEFAULT_HOST = 'https://github.com';
 
+// Per-connection I/O timeout (connect + wait for reply). The response is tiny,
+// so 15s is generous, yet short enough to fail fast on a dead network.
+const REQUEST_TIMEOUT_SECONDS = 15;
+// Hard cap for a whole refresh (token lookup + request). Also covers a hanging
+// `secret-tool` (e.g. locked keyring) or a stuck proxy auto-config lookup.
+const REFRESH_WATCHDOG_SECONDS = 20;
+// network-changed fires in bursts while a connection is being set up.
+const NETWORK_CHANGE_DEBOUNCE_MS = 2000;
+
+const NETWORK_ERROR_CODES = [
+    Gio.IOErrorEnum.TIMED_OUT,
+    Gio.IOErrorEnum.HOST_NOT_FOUND,
+    Gio.IOErrorEnum.HOST_UNREACHABLE,
+    Gio.IOErrorEnum.NETWORK_UNREACHABLE,
+    Gio.IOErrorEnum.CONNECTION_REFUSED,
+    Gio.IOErrorEnum.CONNECTION_CLOSED,
+    Gio.IOErrorEnum.BROKEN_PIPE,
+    Gio.IOErrorEnum.PROXY_FAILED,
+    Gio.IOErrorEnum.PROXY_AUTH_FAILED,
+    Gio.IOErrorEnum.PROXY_NEED_AUTH,
+    Gio.IOErrorEnum.PROXY_NOT_ALLOWED,
+];
+
+function isNetworkError(e) {
+    return e instanceof GLib.Error &&
+        NETWORK_ERROR_CODES.some(code => e.matches(Gio.io_error_quark(), code));
+}
+
+/**
+ * `short` is the panel label, `detail` the (short) text shown in the popup,
+ * `logMessage` the full explanation written to the log (defaults to `detail`).
+ */
 class UsageError extends Error {
-    constructor(short, detail) {
+    constructor(short, detail, logMessage = detail) {
         super(detail);
         this.short = short;
+        this.logMessage = logMessage;
     }
 }
 
@@ -71,10 +104,13 @@ class CopilotUsageIndicator extends PanelMenu.Button {
         this._extensionPath = extensionPath;
         this._settings = settings;
         this._openPreferences = openPreferences;
-        this._cancellable = new Gio.Cancellable();
+        this._destroyed = false;
+        this._requestCancellable = null;
         this._session = this._createSession();
         this._lastData = null;
         this._refreshing = false;
+        this._generation = 0;
+        this._networkTimerId = null;
 
         this._box = new St.BoxLayout({
             style_class: 'panel-status-menu-box',
@@ -124,6 +160,11 @@ class CopilotUsageIndicator extends PanelMenu.Button {
             }
         });
 
+        this._networkMonitor = Gio.NetworkMonitor.get_default();
+        this._networkChangedId = this._networkMonitor.connect(
+            'network-changed', () => this._onNetworkChanged()
+        );
+
         this._refreshUsage();
         this._startTimer();
     }
@@ -151,6 +192,7 @@ class CopilotUsageIndicator extends PanelMenu.Button {
 
     _createSession() {
         const session = new Soup.Session();
+        session.timeout = REQUEST_TIMEOUT_SECONDS;
         const proxyUrl = this._settings.get_string('proxy-url');
 
         if (proxyUrl && proxyUrl.trim() !== '') {
@@ -161,11 +203,41 @@ class CopilotUsageIndicator extends PanelMenu.Button {
         return session;
     }
 
+    /** Drop all pooled connections (they may belong to a previous network) and refresh now. */
     _recreateSession() {
-        if (this._session)
-            this._session.abort();
+        this._session?.abort();
         this._session = this._createSession();
-        this._refreshUsage();
+        this._refreshUsage({force: true});
+    }
+
+    _onNetworkChanged() {
+        if (this._networkTimerId)
+            GLib.source_remove(this._networkTimerId);
+        this._networkTimerId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT, NETWORK_CHANGE_DEBOUNCE_MS, () => {
+                this._networkTimerId = null;
+                if (this._networkMonitor.get_network_available()) {
+                    this._recreateSession();
+                } else {
+                    this._abortInflight();
+                    this._showError('Offline', 'No network connection.');
+                }
+                return GLib.SOURCE_REMOVE;
+            }
+        );
+    }
+
+    _abortInflight() {
+        this._generation++;
+        this._requestCancellable?.cancel();
+        this._session?.abort();
+        this._setRefreshing(false);
+    }
+
+    _setRefreshing(refreshing) {
+        this._refreshing = refreshing;
+        this._refreshButton.reactive = !refreshing;
+        this._refreshButton.opacity = refreshing ? 100 : 255;
     }
 
     _createLabelItem(styleClass) {
@@ -227,8 +299,28 @@ class CopilotUsageIndicator extends PanelMenu.Button {
         this._othersLabel = others.label;
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        const updated = this._createLabelItem('copilot-last-updated-label');
-        this._updatedLabel = updated.label;
+        const updatedRow = new St.BoxLayout({x_expand: true});
+        this._updatedLabel = new St.Label({
+            text: '',
+            style_class: 'copilot-last-updated-label',
+            x_expand: true,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        updatedRow.add_child(this._updatedLabel);
+        this._refreshButton = new St.Button({
+            style_class: 'copilot-refresh-button',
+            child: new St.Icon({icon_name: 'view-refresh-symbolic', icon_size: 14}),
+            accessible_name: 'Refresh now',
+            can_focus: true,
+            reactive: true,
+            track_hover: true,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        this._refreshButton.connect('clicked', () => this._refreshUsage({force: true}));
+        updatedRow.add_child(this._refreshButton);
+        const updatedItem = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+        updatedItem.add_child(updatedRow);
+        this.menu.addMenuItem(updatedItem);
 
         const settingsItem = new PopupMenu.PopupMenuItem('Settings');
         settingsItem.connect('activate', () => this._openPreferences());
@@ -259,26 +351,65 @@ class CopilotUsageIndicator extends PanelMenu.Button {
         this._startTimer();
     }
 
-    async _refreshUsage() {
-        if (this._refreshing)
+    /**
+     * Refresh the usage data. With `force`, any refresh already in flight is
+     * cancelled and superseded (used for manual refresh and network changes).
+     */
+    async _refreshUsage({force = false} = {}) {
+        if (this._refreshing && !force)
             return;
-        this._refreshing = true;
+
+        this._requestCancellable?.cancel();
+        const cancellable = new Gio.Cancellable();
+        this._requestCancellable = cancellable;
+        const generation = ++this._generation;
+        this._setRefreshing(true);
+        this._updatedLabel.set_text('Updating…');
+
+        let timedOut = false;
+        let watchdogId = GLib.timeout_add_seconds(
+            GLib.PRIORITY_DEFAULT, REFRESH_WATCHDOG_SECONDS, () => {
+                watchdogId = 0;
+                timedOut = true;
+                cancellable.cancel();
+                return GLib.SOURCE_REMOVE;
+            }
+        );
+
         try {
-            const {token, host} = await this._getCredentials();
-            const raw = await this._fetchUsage(token, host);
+            if (!this._networkMonitor.get_network_available())
+                throw new UsageError('Offline', 'No network connection.');
+
+            const {token, host} = await this._getCredentials(cancellable);
+            const raw = await this._fetchUsage(token, host, cancellable);
+            if (generation !== this._generation)
+                return;
             const usage = normalizeUsage(raw);
             if (!usage)
                 throw new UsageError('Unsupported', 'No premium quota in the Copilot response');
             this._lastData = usage;
             this._updateDisplay(usage);
         } catch (e) {
-            if (this._cancellable.is_cancelled())
+            // Superseded by a newer refresh, or the extension was disabled.
+            if (generation !== this._generation || this._destroyed)
                 return;
-            const short = e instanceof UsageError ? e.short : 'Error';
-            console.error(`Copilot Usage: ${e.message}`);
-            this._showError(short, e.message);
+            let error = e;
+            if (timedOut) {
+                error = new UsageError(
+                    'Offline',
+                    `No answer within ${REFRESH_WATCHDOG_SECONDS}s`,
+                    `No answer within ${REFRESH_WATCHDOG_SECONDS}s (network, proxy or keyring not responding).`
+                );
+            } else if (isNetworkError(e)) {
+                error = new UsageError('Offline', e.message);
+            }
+            console.error(`Copilot Usage: ${error.logMessage ?? error.message}`);
+            this._showError(error instanceof UsageError ? error.short : 'Error', error.message);
         } finally {
-            this._refreshing = false;
+            if (watchdogId)
+                GLib.source_remove(watchdogId);
+            if (generation === this._generation && !this._destroyed)
+                this._setRefreshing(false);
         }
     }
 
@@ -286,8 +417,8 @@ class CopilotUsageIndicator extends PanelMenu.Button {
      * Token lookup order: Copilot CLI keyring entry, COPILOT_GITHUB_TOKEN/GH_TOKEN/
      * GITHUB_TOKEN env vars, then `gh auth token`.
      */
-    async _getCredentials() {
-        const config = await readCopilotConfig(this._cancellable);
+    async _getCredentials(cancellable) {
+        const config = await readCopilotConfig(cancellable);
         const account = pickAccount(config);
         const host = account?.host ?? DEFAULT_HOST;
 
@@ -296,7 +427,7 @@ class CopilotUsageIndicator extends PanelMenu.Button {
             for (const username of keyringUsernames(account.host, account.login)) {
                 token = await runCommand(
                     ['secret-tool', 'lookup', 'service', KEYRING_SERVICE, 'username', username],
-                    this._cancellable
+                    cancellable
                 );
                 if (token)
                     break;
@@ -309,20 +440,21 @@ class CopilotUsageIndicator extends PanelMenu.Button {
         if (!token) {
             token = await runCommand(
                 ['gh', 'auth', 'token', '--hostname', hostname(host)],
-                this._cancellable
+                cancellable
             );
         }
 
         if (!token) {
             throw new UsageError(
                 'No token',
+                'No Copilot token found',
                 'No Copilot token found. Sign in with the Copilot CLI and install secret-tool (libsecret-tools).'
             );
         }
         return {token, host};
     }
 
-    async _fetchUsage(token, host) {
+    async _fetchUsage(token, host, cancellable) {
         const base = apiBaseForHost(host);
         if (!base)
             throw new UsageError('Error', `Invalid host in Copilot config: ${host}`);
@@ -336,7 +468,7 @@ class CopilotUsageIndicator extends PanelMenu.Button {
 
         const bytes = await new Promise((resolve, reject) => {
             this._session.send_and_read_async(
-                message, GLib.PRIORITY_DEFAULT, this._cancellable,
+                message, GLib.PRIORITY_DEFAULT, cancellable,
                 (session, result) => {
                     try {
                         resolve(session.send_and_read_finish(result));
@@ -349,9 +481,20 @@ class CopilotUsageIndicator extends PanelMenu.Button {
 
         const status = message.status_code;
         if (status === 401)
-            throw new UsageError('Sign in', 'Copilot token rejected (401). Sign in again with the Copilot CLI.');
+            throw new UsageError(
+                'Sign in',
+                'Copilot token rejected (HTTP 401)',
+                'Copilot token rejected (HTTP 401). Sign in again with the Copilot CLI.'
+            );
         if (status === 403 || status === 429)
             throw new UsageError('Rate limit', `Access denied or rate limited (HTTP ${status}).`);
+        if (status === 407) {
+            throw new UsageError(
+                'Proxy',
+                'The proxy requires authentication (HTTP 407)',
+                'The proxy requires authentication (HTTP 407). Set Proxy URL to direct:// in the extension settings to connect without the system proxy.'
+            );
+        }
         if (status === 404)
             throw new UsageError('No Copilot', 'No Copilot access found for this account (HTTP 404).');
         if (status !== 200)
@@ -365,6 +508,7 @@ class CopilotUsageIndicator extends PanelMenu.Button {
             this._updatedLabel.set_text(`Update failed: ${short}. Showing last data.`);
             return;
         }
+        this._updatedLabel.set_text(`Update failed: ${short}`);
         this._label.set_text(short);
         this._percentLabel.set_text('—');
         this._detailLabel.set_text(detail);
@@ -452,8 +596,17 @@ class CopilotUsageIndicator extends PanelMenu.Button {
     }
 
     destroy() {
+        this._destroyed = true;
         this._stopTimer();
-        this._cancellable?.cancel();
+        if (this._networkTimerId) {
+            GLib.source_remove(this._networkTimerId);
+            this._networkTimerId = null;
+        }
+        if (this._networkChangedId) {
+            this._networkMonitor.disconnect(this._networkChangedId);
+            this._networkChangedId = null;
+        }
+        this._requestCancellable?.cancel();
         if (this._session) {
             this._session.abort();
             this._session = null;

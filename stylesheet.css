@@ -88,3 +88,17 @@
     background-color: rgba(128, 128, 128, 0.55);
     width: 200px;
 }
+
+.copilot-refresh-button {
+    padding: 3px 6px;
+    border-radius: 4px;
+}
+
+.copilot-refresh-button:hover,
+.copilot-refresh-button:focus {
+    background-color: rgba(128, 128, 128, 0.25);
+}
+
+.copilot-refresh-button:active {
+    background-color: rgba(128, 128, 128, 0.4);
+}
